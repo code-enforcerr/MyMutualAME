@@ -9,11 +9,11 @@ const archiver = require('archiver');
 const { runAutomation } = require('./automation');
 
 // ================== Config knobs ==================
-const CONCURRENCY      = parseInt(process.env.CONCURRENCY || '3', 10);         // parallel entries
-const ENTRY_TIMEOUT_MS = parseInt(process.env.ENTRY_TIMEOUT_MS || '80000', 10);// per entry timeout
-const RETRY_ERRORS     = parseInt(process.env.RETRY_ERRORS || '1', 10);        // retry passes
-const RETRY_DELAY_MS   = parseInt(process.env.RETRY_DELAY_MS || '2000', 10);   // delay before retry pass
-const MAX_ENTRIES      = parseInt(process.env.MAX_ENTRIES || '70', 10);        // per-batch cap
+const CONCURRENCY      = parseInt(process.env.CONCURRENCY || '3', 10);
+const ENTRY_TIMEOUT_MS = parseInt(process.env.ENTRY_TIMEOUT_MS || '120000', 10); // generous wrapper timeout
+const RETRY_ERRORS     = parseInt(process.env.RETRY_ERRORS || '1', 10);
+const RETRY_DELAY_MS   = parseInt(process.env.RETRY_DELAY_MS || '2000', 10);
+const MAX_ENTRIES      = parseInt(process.env.MAX_ENTRIES || '70', 10);
 const SCREENSHOT_DIR   = process.env.SHOT_DIR || path.resolve('screenshots');
 // ==================================================
 
@@ -75,10 +75,9 @@ function nowStamp() {
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
 }
 
-// Local/Render friendly writable base
 async function pickWritableBaseDir() {
-  const preferred = SCREENSHOT_DIR;              // env or ./screenshots
-  const fallback  = path.resolve('screenshots'); // local default
+  const preferred = SCREENSHOT_DIR;
+  const fallback  = path.resolve('screenshots');
   try { await ensureDir(preferred); return preferred; }
   catch (e) {
     console.warn(`SHOT_DIR not writable (${preferred}): ${e.code}. Falling back to ${fallback}`);
@@ -104,6 +103,7 @@ async function latestBatchDir(chatId) {
   } catch { return null; }
 }
 
+// ---- Safer zipDirectory (glob) ----
 async function zipDirectory(sourceDir, outPath) {
   await ensureDir(path.dirname(outPath));
   return new Promise((resolve, reject) => {
@@ -111,104 +111,17 @@ async function zipDirectory(sourceDir, outPath) {
     const archive = archiver('zip', { zlib: { level: 9 } });
 
     output.on('close', () => resolve(outPath));
+    archive.on('warning', (err) => console.warn('archiver warning:', err));
     archive.on('error', reject);
 
-    // Skip any .zip files inside the folder (safety)
-    archive.directory(sourceDir, false, { filter: file => !/\.zip$/i.test(file) });
     archive.pipe(output);
+    archive.glob('**/*', {
+      cwd: sourceDir,
+      dot: true,
+      nodir: false,
+      ignore: ['**/*.zip']
+    });
     archive.finalize();
-  });
-}
-
-// ---------- Intake (NEW FORMAT) ----------
-// LASTNAME,DOB,ZIP,LAST4
-function normalizeDobToMMDDYYYY(input) {
-  if (!input) return null;
-  const s = String(input).trim();
-
-  let m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
-  if (m) return `${m[2]}/${m[3]}/${m[1]}`;
-
-  m = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/.exec(s);
-  if (m) {
-    let [, a, b, c] = m;
-    const mm = String(parseInt(a, 10)).padStart(2, '0');
-    const dd = String(parseInt(b, 10)).padStart(2, '0');
-    let yyyy = c;
-    if (yyyy.length === 2) {
-      const yy = parseInt(yyyy, 10);
-      yyyy = (yy <= 30 ? 2000 + yy : 1900 + yy).toString();
-    }
-    if (+mm < 1 || +mm > 12 || +dd < 1 || +dd > 31 || +yyyy < 1900 || +yyyy > 2100) return null;
-    return `${mm}/${dd}/${yyyy}`;
-  }
-
-  const d = new Date(s);
-  if (!isNaN(d)) {
-    const mm = String(d.getMonth() + 1).padStart(2, '0');
-    const dd = String(d.getDate()).padStart(2, '0');
-    const yyyy = String(d.getFullYear());
-    return `${mm}/${dd}/${yyyy}`;
-  }
-  return null;
-}
-
-function parseEntryLine(raw) {
-  if (!raw) return { ok:false, error:'empty_line', raw };
-  let s = raw.normalize('NFKC')
-    .replace(/\u00A0/g, ' ')
-    .replace(/[，、]/g, ',')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  const parts = s.split(/[|,]/).map(t => t.trim());
-  if (parts.length !== 4) return { ok:false, error:'bad_field_count', raw, got: parts.length };
-
-  const [lastNameRaw, dobRaw, zipRaw, last4Raw] = parts;
-
-  const lastName = lastNameRaw.replace(/[^a-zA-Z' -]/g, '').trim();
-  if (!lastName) return { ok:false, error:'invalid_lastname', raw, value:lastNameRaw };
-
-  const dob = normalizeDobToMMDDYYYY(dobRaw);
-  if (!dob) return { ok:false, error:'invalid_dob', raw, value:dobRaw };
-
-  const zip = /^\d{5}(?:-\d{4})?$/.test(zipRaw) ? zipRaw : null;
-  if (!zip) return { ok:false, error:'invalid_zip', raw, value:zipRaw };
-
-  const last4 = /^\d{4}$/.test(last4Raw) ? last4Raw : null;
-  if (!last4) return { ok:false, error:'invalid_last4', raw, value:last4Raw };
-
-  return { ok:true, lastName, dob, zip, last4, raw:s };
-}
-
-function parseBulk(text) {
-  const lines = String(text || '')
-    .split(/\r?\n/)
-    .map(s => s.trim())
-    .filter(s => s && !s.startsWith('#'));
-
-  const out = [];
-  for (const [i, line] of lines.entries()) {
-    const r = parseEntryLine(line);
-    out.push({ index: i + 1, input: line, ...r });
-  }
-  return out;
-}
-
-// --- Simple concurrency limiter ---
-function createLimiter(limit) {
-  let active = 0;
-  const queue = [];
-  const next = () => {
-    if (active >= limit || queue.length === 0) return;
-    active++;
-    const { fn, resolve, reject } = queue.shift();
-    fn().then(v => { active--; resolve(v); next(); })
-      .catch(e => { active--; reject(e); next(); });
-  };
-  return async fn => new Promise((resolve, reject) => {
-    queue.push({ fn, resolve, reject });
-    next();
   });
 }
 
@@ -291,6 +204,7 @@ bot.onText(/^\/status$/, async (msg) => {
   bot.sendMessage(chatId, `✅ Running.\nBatches: ${batchCount}\nFiles: ${fileCount}\nConcurrency: x${CONCURRENCY}`);
 });
 
+// ---------- /export ----------
 bot.onText(/^\/export$/, async (msg) => {
   const chatId = msg.chat.id;
   if (!isApproved(msg.from.id)) return;
@@ -300,6 +214,12 @@ bot.onText(/^\/export$/, async (msg) => {
 
   const zipPath = path.join(dir, '..', 'latest_export.zip');
   try {
+    // debug: list files
+    try {
+      const files = await fsp.readdir(dir);
+      await bot.sendMessage(chatId, `📂 Batch has ${files.length} items:\n` + files.slice(0, 10).join('\n') + (files.length > 10 ? '\n…' : ''));
+    } catch {}
+
     await zipDirectory(dir, zipPath);
     const stat = await fsp.stat(zipPath);
     const MB = stat.size / (1024 * 1024);
@@ -316,14 +236,11 @@ bot.onText(/^\/export$/, async (msg) => {
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text ?? '';
-
-  // skip commands
   if (/^\/(start|help|export|clean|whoami|status)\b/i.test(text)) return;
 
   if (!isApproved(msg.from.id)) {
     return bot.sendMessage(chatId, '⛔️ You are not approved to use this bot.');
   }
-
   if (!text || typeof text !== 'string') return;
 
   const parsed = parseBulk(text);
@@ -345,7 +262,6 @@ bot.on('message', async (msg) => {
   const batchDir = await getBatchDir(chatId);
   const resultsJsonPath = path.join(batchDir, 'results.json');
 
-  // Initial heads-up
   await bot.sendMessage(
     chatId,
     `🧾 Received ${parsed.length} lines • Valid: ${valid.length} • Skipped: ${invalid.length}\nStarting with concurrency x${CONCURRENCY}…`
@@ -378,7 +294,7 @@ bot.on('message', async (msg) => {
         const shotName = `${String(entry.index).padStart(3,'0')}_${entry.lastName.replace(/\s+/g,'_')}_${entry.last4}.jpg`;
         const shotPath = path.join(batchDir, shotName);
 
-        const { status, screenshotPath: savedPath } = await Promise.race([
+        const { status, screenshotPath: savedPath, error } = await Promise.race([
           runAutomation(entry.lastName, entry.dob, entry.zip, entry.last4, shotPath),
           new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ENTRY_TIMEOUT_MS))
         ]);
@@ -388,11 +304,11 @@ bot.on('message', async (msg) => {
         else if (status === 'unknown') unknownCount++;
         else errorCount++;
 
-        return { index: entry.index, input: entry.input, ok: true, status, screenshot: savedPath || shotPath };
+        return { index: entry.index, input: entry.input, ok: true, status, screenshot: savedPath || shotPath, error };
       } catch (err) {
         if (pass > 1 + RETRY_ERRORS) {
           errorCount++;
-          return { index: entry.index, input: entry.input, ok: false, error: String(err && err.message || err) };
+          return { index: entry.index, input: entry.input, ok: false, error: String(err?.message || err) };
         }
         await delay(RETRY_DELAY_MS);
       }
@@ -423,13 +339,23 @@ bot.on('message', async (msg) => {
     results
   }, null, 2));
 
-  // Final summary
+  const errorReasons = results
+    .filter(r => !r.ok || r.status === 'error')
+    .map(r => (r.error || '').slice(0, 200))
+    .filter(Boolean)
+    .slice(0, 3);
+
+  let reasonsBlock = '';
+  if (errorReasons.length) {
+    reasonsBlock = '\n\n🧪 Sample error reasons:\n' + errorReasons.map((e, i) => ` ${i+1}. ${e}`).join('\n');
+  }
+
   const finalSummary =
 `✅ Valid: ${validCount}
 ❌ Incorrect: ${incorrectCount}
 ❓ Unknown: ${unknownCount}
 ⚠️ Errors: ${errorCount}
-⛔ Invalid: ${invalid.length}`;
+⛔ Invalid: ${invalid.length}` + reasonsBlock;
 
   try {
     await bot.editMessageText(`✅ ${total}/${total} done`, { chat_id: progressIdent.chat_id, message_id: progressIdent.message_id });
@@ -442,6 +368,12 @@ bot.on('message', async (msg) => {
     const parentDir = path.join(batchDir, '..');
     await ensureDir(parentDir);
     const zipPath = path.join(parentDir, `export_${Date.now()}.zip`);
+
+    // small listing before zipping
+    try {
+      const files = await fsp.readdir(batchDir);
+      await bot.sendMessage(chatId, `📂 Batch has ${files.length} items:\n` + files.slice(0, 10).join('\n') + (files.length > 10 ? '\n…' : ''));
+    } catch {}
 
     await zipDirectory(batchDir, zipPath);
     const stat = await fsp.stat(zipPath);
@@ -459,7 +391,7 @@ bot.on('message', async (msg) => {
 
 console.log('🤖 Bot is running.');
 
-// ---------- Parsers (placed after bot logic for clarity) ----------
+// ---------- Parsers (helpers) ----------
 function parseBulk(text) {
   const lines = String(text || '')
     .split(/\r?\n/)
@@ -473,6 +405,7 @@ function parseBulk(text) {
   }
   return out;
 }
+
 function parseEntryLine(raw) {
   if (!raw) return { ok:false, error:'empty_line', raw };
   let s = raw.normalize('NFKC')
@@ -500,6 +433,7 @@ function parseEntryLine(raw) {
 
   return { ok:true, lastName, dob, zip, last4, raw:s };
 }
+
 function normalizeDobToMMDDYYYY(input) {
   if (!input) return null;
   const s = String(input).trim();
@@ -529,4 +463,21 @@ function normalizeDobToMMDDYYYY(input) {
     return `${mm}/${dd}/${yyyy}`;
   }
   return null;
+}
+
+// --- Simple concurrency limiter ---
+function createLimiter(limit) {
+  let active = 0;
+  const queue = [];
+  const next = () => {
+    if (active >= limit || queue.length === 0) return;
+    active++;
+    const { fn, resolve, reject } = queue.shift();
+    fn().then(v => { active--; resolve(v); next(); })
+      .catch(e => { active--; reject(e); next(); });
+  };
+  return async fn => new Promise((resolve, reject) => {
+    queue.push({ fn, resolve, reject });
+    next();
+  });
 }

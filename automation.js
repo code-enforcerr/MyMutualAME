@@ -9,7 +9,10 @@ let _browser = null;
 const VIEWPORT_W = parseInt(process.env.VIEWPORT_W || '800', 10);
 const VIEWPORT_H = parseInt(process.env.VIEWPORT_H || '980', 10);
 const JPEG_QUALITY = Math.min(95, Math.max(30, parseInt(process.env.JPEG_QUALITY || '70', 10)));
-const RESULT_TIMEOUT_MS = parseInt(process.env.RESULT_TIMEOUT_MS || '8000', 10);
+// Bump result window to be more forgiving
+const RESULT_TIMEOUT_MS = parseInt(process.env.RESULT_TIMEOUT_MS || '20000', 10);
+// Enable per-run trace by setting TRACE=1
+const ENABLE_TRACE = String(process.env.TRACE || '').trim() === '1';
 
 async function getBrowser() {
   if (_browser && _browser.isConnected()) return _browser;
@@ -55,8 +58,11 @@ async function tryClickContinue(page) {
   const candidates = [
     'button:has-text("Continue")',
     'button:has-text("CONTINUE")',
+    'button:has-text("Next")',
     'input[type="submit"][value*="Continue" i]',
+    'input[type="submit"][value*="Next" i]',
     '[role="button"]:has-text("Continue")',
+    '[role="button"]:has-text("Next")',
     'button[type="submit"]',
   ];
   for (const sel of candidates) {
@@ -88,7 +94,7 @@ async function tryFill(page, selectors, value) {
 
 // Panel-exact screenshot (alert + inputs + buttons)
 async function screenshotPanel(page, outPath) {
-  let target = page.locator('form:has(button:has-text("Continue"))').first();
+  let target = page.locator('form:has(button:has-text("Continue")), form:has(button:has-text("Next"))').first();
   try {
     await target.waitFor({ state: 'visible', timeout: 6000 });
 
@@ -142,6 +148,15 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36'
   });
 
+  // Optional tracing for deep debugging (set TRACE=1)
+  if (ENABLE_TRACE) {
+    try {
+      const tracesDir = process.env.TRACES_DIR || path.resolve('traces');
+      await fsp.mkdir(tracesDir, { recursive: true }).catch(()=>{});
+      await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+    } catch {}
+  }
+
   // Do NOT block resources (fonts/images/css sometimes required)
   await context.route('**/*', (route) => route.continue());
 
@@ -165,10 +180,38 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
     try { await page.waitForLoadState('networkidle', { timeout: 7000 }); } catch {}
+
+    // --- WAF / anti-bot detection (explicit) ---
+    const html = await page.content();
+    if (/Incapsula|Imperva|Access Denied|Request unsuccessful|Bot detected/i.test(html)) {
+      throw new Error('Blocked by anti-bot/WAF. The real form did not load.');
+    }
+
+    // --- Form preflight: verify fields exist before trying to fill ---
+    const hasLastName = await page.locator(
+      'label:has-text("Last Name"), label:has-text("Last name"), input[placeholder*="Last Name" i], input[name*="last" i], input[id*="last" i]'
+    ).first().count();
+    const hasDob = await page.locator(
+      'label:has-text("Date of Birth"), label:has-text("Date of birth"), input[placeholder*="mm/dd/yyyy" i], input[placeholder*="DOB" i], input[name*="dob" i], input[id*="dob" i]'
+    ).first().count();
+    const hasZip = await page.locator(
+      'label:has-text("US Zip Code"), label:has-text("ZIP Code"), input[placeholder*="Zip" i], input[name*="zip" i], input[id*="zip" i], input[name*="postal" i]'
+    ).first().count();
+    const hasL4  = await page.locator(
+      'label:has-text("Last 4 Digits of SSN"), label:has-text("Last 4"), input[placeholder*="Last 4" i], input[name*="last4" i], input[id*="last4" i], input[name*="ssn" i]'
+    ).first().count();
+
+    if (!hasLastName || !hasDob || !hasZip || !hasL4) {
+      throw new Error(`Form fields not found on page (last:${!!hasLastName} dob:${!!hasDob} zip:${!!hasZip} last4:${!!hasL4}). Check TARGET_URL and selectors.`);
+    }
+
+    // (Optional) some pages show a heading; not required to proceed
     try { await page.locator('text=/Verify your Identity/i').first().waitFor({ timeout: 6000 }); } catch {}
 
+    // Fill fields with broadened selectors
     const okLast = await tryFill(page, [
       'label:has-text("Last Name") ~ input',
+      'label:has-text("Last name") ~ input',
       'input[placeholder*="Last Name" i]',
       'input[name*="last" i]',
       'input[id*="last" i]'
@@ -176,6 +219,7 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
 
     const okDOB = await tryFill(page, [
       'label:has-text("Date of Birth") ~ input',
+      'label:has-text("Date of birth") ~ input',
       'input[placeholder*="mm/dd/yyyy" i]',
       'input[placeholder*="DOB" i]',
       'input[name*="dob" i]',
@@ -184,6 +228,7 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
 
     const okZIP = await tryFill(page, [
       'label:has-text("US Zip Code") ~ input',
+      'label:has-text("ZIP Code") ~ input',
       'input[placeholder*="Zip" i]',
       'input[name*="zip" i]',
       'input[id*="zip" i]',
@@ -192,10 +237,11 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
 
     const okL4 = await tryFill(page, [
       'label:has-text("Last 4 Digits of SSN") ~ input',
+      'label:has-text("Last 4") ~ input',
       'input[placeholder*="Last 4" i]',
       'input[name*="last4" i]',
       'input[id*="last4" i]',
-      'input[name*="ssn" i][maxlength="4"]'
+      'input[name*="ssn" i]'
     ], String(last4).trim());
 
     if (!okLast || !okDOB || !okZIP || !okL4) {
@@ -203,11 +249,12 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
     }
 
     const clicked = await tryClickContinue(page);
-    if (!clicked) throw new Error('Could not find the Continue button');
+    if (!clicked) throw new Error('Could not find the Continue/Next button');
 
     try { await page.waitForLoadState('networkidle', { timeout: 4000 }); } catch {}
     await page.waitForTimeout(1200);
 
+    // Wait for a result (valid/incorrect), up to RESULT_TIMEOUT_MS
     const deadline = Date.now() + RESULT_TIMEOUT_MS;
     while (Date.now() < deadline) {
       const c = await classifyResult(page);
@@ -218,6 +265,12 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
 
     await screenshotPanel(page, shotPath);
 
+    // Save trace if enabled
+    if (ENABLE_TRACE) {
+      const tracePath = path.join(path.dirname(shotPath), path.basename(shotPath).replace(/\.jpe?g$/i, '_trace.zip'));
+      try { await context.tracing.stop({ path: tracePath }); } catch {}
+      return { status, screenshotPath: shotPath, tracePath };
+    }
     return { status, screenshotPath: shotPath };
   } catch (err) {
     const reason = err?.message || String(err);
@@ -228,6 +281,12 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
       const htmlPath = shotPath.replace(/\.jpe?g$/i, '.html');
       await fsp.writeFile(htmlPath, await page.content(), 'utf8');
     } catch {}
+
+    if (ENABLE_TRACE) {
+      const tracePath = shotPath.replace(/\.jpe?g$/i, '_trace.zip');
+      try { await context.tracing.stop({ path: tracePath }); } catch {}
+      return { status: 'error', screenshotPath: shotPath, error: reason, tracePath };
+    }
     return { status: 'error', screenshotPath: shotPath, error: reason };
   } finally {
     try { await context.close(); } catch {}
