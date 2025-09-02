@@ -28,6 +28,7 @@ function sanitize(s = '') { return String(s).replace(/[^a-z0-9._-]/gi, '_'); }
 async function ensureWritablePath(p) { await fsp.mkdir(path.dirname(p), { recursive: true }); return p; }
 function withUniqueSuffix(p) { const ext = path.extname(p) || '.jpg'; const base = p.slice(0, -ext.length); return `${base}_${ts()}${ext}`; }
 
+// Accept common forms and normalize to MM/DD/YYYY
 function normalizeDOB(input) {
   if (!input) return '';
   const s = String(input).trim();
@@ -56,14 +57,17 @@ async function uniqueShotPath(last4, zip) {
 async function tryClickContinue(page) {
   const candidates = [
     'button:has-text("Continue")',
+    'button:has-text("CONTINUE")',
     'input[type="submit"][value*="Continue" i]',
-    '[role="button"]:has-text("Continue")'
+    '[role="button"]:has-text("Continue")',
+    'button[type="submit"]',
   ];
   for (const sel of candidates) {
     try {
       const b = page.locator(sel).first();
-      await b.waitFor({ state: 'visible', timeout: 2500 });
-      await b.click({ timeout: 2500 });
+      await b.waitFor({ state: 'visible', timeout: 4000 });
+      await b.scrollIntoViewIfNeeded().catch(()=>{});
+      await b.click({ timeout: 4000 });
       return true;
     } catch {}
   }
@@ -73,9 +77,12 @@ async function tryClickContinue(page) {
 async function tryFill(page, selectors, value) {
   for (const sel of selectors) {
     try {
-      const loc = page.locator(sel).first();
-      await loc.waitFor({ state: 'visible', timeout: 2500 });
-      await loc.fill(String(value));
+      const el = page.locator(sel).first();
+      await el.waitFor({ state: 'visible', timeout: 4000 });
+      await el.scrollIntoViewIfNeeded().catch(()=>{});
+      await el.click({ timeout: 2000 }).catch(()=>{});
+      await el.fill(''); // clear first
+      await el.type(String(value), { delay: 30 });
       return true;
     } catch {}
   }
@@ -84,16 +91,15 @@ async function tryFill(page, selectors, value) {
 
 // NEW: take a screenshot of exactly the central panel (alert + inputs + buttons)
 async function screenshotPanel(page, outPath) {
-  // 1) Prefer a form that contains the Continue button
+  // Prefer a form that contains the Continue button
   let target = page.locator('form:has(button:has-text("Continue"))').first();
   try {
     await target.waitFor({ state: 'visible', timeout: 4000 });
 
-    // 2) Many sites wrap the form in a panel <div> that also contains the red alert.
-    // Jump one level up if that parent exists; this tends to match your sample exactly.
+    // Many sites wrap the form in a panel <div> that also contains the red alert.
+    // Jump one level up if that parent contains a heading/alert; this matches your sample.
     const parent = target.locator('..');
     try {
-      // If the parent contains the alert or the heading, use it; else stick with form
       const hasAlert = await parent.locator('text=/unable to confirm your identity/i').count();
       const hasHeading = await parent.locator('text=/Verify your Identity/i').count();
       if (hasAlert || hasHeading) target = parent;
@@ -102,7 +108,7 @@ async function screenshotPanel(page, outPath) {
     await target.screenshot({ path: outPath, type: 'jpeg', quality: JPEG_QUALITY });
     return outPath;
   } catch {
-    // 3) Fallback to the visible viewport (not full page)
+    // Fallback: visible viewport (not full page)
     await page.screenshot({ path: outPath, type: 'jpeg', quality: JPEG_QUALITY, fullPage: false });
     return outPath;
   }
@@ -140,10 +146,10 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36'
   });
 
-  // keep fast
+  // Keep it fast, but don't block fonts/CSS (labels can depend on webfonts)
   await context.route('**/*', (route) => {
     const t = route.request().resourceType();
-    if (t === 'image' || t === 'media' || t === 'font') return route.abort();
+    if (t === 'media' || t === 'image') return route.abort(); // allow fonts & css
     return route.continue();
   });
 
@@ -166,7 +172,7 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Fill the four fields (labels/places match your sample)
+    // Fill the four fields (labels/placeholders matching your UI)
     const okLast = await tryFill(page, [
       'label:has-text("Last Name") ~ input',
       'input[placeholder*="Last Name" i]',
@@ -205,7 +211,11 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
     const clicked = await tryClickContinue(page);
     if (!clicked) throw new Error('Could not find the Continue button');
 
-    // Give the page a moment to respond
+    // Give the page time to respond and render any alert
+    try { await page.waitForLoadState('networkidle', { timeout: 4000 }); } catch {}
+    await page.waitForTimeout(1200);
+
+    // Try to classify outcome for a few cycles
     const deadline = Date.now() + RESULT_TIMEOUT_MS;
     while (Date.now() < deadline) {
       const c = await classifyResult(page);
@@ -214,14 +224,14 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
     }
     if (status === 'error' || status === 'unknown') status = await classifyResult(page);
 
-    // EXACT PANEL SHOT
+    // EXACT PANEL SHOT (alert + inputs + buttons)
     await screenshotPanel(page, shotPath);
 
     return { status, screenshotPath: shotPath };
   } catch (err) {
     const reason = err?.message || String(err);
     try {
-      // fallback: at least capture viewport for debugging
+      // Fallback: capture viewport + write a small note for debugging
       await page.screenshot({ path: shotPath, type: 'jpeg', quality: JPEG_QUALITY, fullPage: false });
       const notePath = shotPath.replace(/\.jpe?g$/i, '.txt');
       await fsp.writeFile(notePath, `Error: ${reason}\nURL: ${await page.url().catch(()=>'?')}\n`, 'utf8');

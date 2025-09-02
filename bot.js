@@ -23,7 +23,21 @@ if (!process.env.TELEGRAM_TOKEN) {
   process.exit(1);
 }
 
-const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
+// Start with polling disabled; we'll delete webhook then start polling to avoid 409s.
+const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: false });
+
+// Ensure we own the connection: kill webhook, then start polling cleanly
+(async () => {
+  try {
+    await bot.deleteWebHook({ drop_pending_updates: true }); // also clears any backlog
+    try { await bot.stopPolling(); } catch {}
+    await bot.startPolling({ params: { allowed_updates: ['message'] } });
+    console.log('🤖 Bot is running (polling started cleanly).');
+  } catch (e) {
+    console.error('Failed to start polling:', e?.message || e);
+    process.exit(1);
+  }
+})();
 
 // ---- 409 conflict auto-recovery ----
 bot.on('polling_error', async (err) => {
@@ -89,8 +103,9 @@ async function zipDirectory(sourceDir, outPath) {
     output.on('close', () => resolve(outPath));
     archive.on('error', reject);
 
+    // Safety: skip any .zip files inside the source directory
+    archive.directory(sourceDir, false, { filter: file => !/\.zip$/i.test(file) });
     archive.pipe(output);
-    archive.directory(sourceDir, false);
     archive.finalize();
   });
 }
@@ -383,9 +398,7 @@ bot.on('message', async (msg) => {
     limiter(() => runOne(v)).then(r => {
       results.push(r);
       done++;
-      // update each completion; if you want fewer edits:
-      // if (done === total || done % 5 === 0) updateProgress();
-      updateProgress();
+      updateProgress(); // if needed, throttle: if (done === total || done % 5 === 0) updateProgress();
     })
   ));
 
@@ -420,9 +433,12 @@ bot.on('message', async (msg) => {
   // Send the summary as a separate message (emojis + line breaks)
   await bot.sendMessage(chatId, finalSummary);
 
-  // Auto-export ZIP (same size guard as /export)
+  // Auto-export ZIP (write OUTSIDE the batch folder to avoid zip-in-zip)
   try {
-    const zipPath = path.join(batchDir, `screenshots-${Date.now()}.zip`);
+    const parentDir = path.join(batchDir, '..');     // safe: not inside the folder being zipped
+    await ensureDir(parentDir);
+    const zipPath = path.join(parentDir, `export_${Date.now()}.zip`);
+
     await zipDirectory(batchDir, zipPath);
     const stat = await fsp.stat(zipPath);
     const MB = stat.size / (1024 * 1024);
