@@ -9,12 +9,20 @@ const archiver = require('archiver');
 const { runAutomation } = require('./automation');
 
 // ================== Config knobs ==================
-const CONCURRENCY      = parseInt(process.env.CONCURRENCY || '3', 10);
-const ENTRY_TIMEOUT_MS = parseInt(process.env.ENTRY_TIMEOUT_MS || '120000', 10); // generous wrapper timeout
-const RETRY_ERRORS     = parseInt(process.env.RETRY_ERRORS || '1', 10);
-const RETRY_DELAY_MS   = parseInt(process.env.RETRY_DELAY_MS || '2000', 10);
-const MAX_ENTRIES      = parseInt(process.env.MAX_ENTRIES || '70', 10);
-const SCREENSHOT_DIR   = process.env.SHOT_DIR || path.resolve('screenshots');
+// Run sequentially by default; override with CONCURRENCY=3 etc.
+const CONCURRENCY       = parseInt(process.env.CONCURRENCY || '1', 10);
+// Wrapper timeout per entry (automation has its own internal waits)
+const ENTRY_TIMEOUT_MS  = parseInt(process.env.ENTRY_TIMEOUT_MS || '120000', 10);
+// Retry passes for hard errors/timeouts
+const RETRY_ERRORS      = parseInt(process.env.RETRY_ERRORS || '1', 10);
+// Delay before a retry pass
+const RETRY_DELAY_MS    = parseInt(process.env.RETRY_DELAY_MS || '2000', 10);
+// Gentle pause before starting each entry (helps avoid WAF rate heuristics)
+const ENTRY_SPREAD_MS   = parseInt(process.env.ENTRY_SPREAD_MS || '1500', 10);
+// Per-batch cap
+const MAX_ENTRIES       = parseInt(process.env.MAX_ENTRIES || '70', 10);
+// Screenshot base dir (falls back to ./screenshots if unwritable)
+const SCREENSHOT_DIR    = process.env.SHOT_DIR || path.resolve('screenshots');
 // ==================================================
 
 // --- Fail fast if token is missing ---
@@ -170,7 +178,7 @@ LASTNAME,DOB,ZIP,LAST4
 • LAST4: exactly 4 digits
 
 Env knobs:
-MAX_ENTRIES=${MAX_ENTRIES}, CONCURRENCY=${CONCURRENCY}, TIMEOUT=${ENTRY_TIMEOUT_MS}ms, RETRIES=${RETRY_ERRORS}`);
+MAX_ENTRIES=${MAX_ENTRIES}, CONCURRENCY=${CONCURRENCY}, ENTRY_SPREAD_MS=${ENTRY_SPREAD_MS}ms, TIMEOUT=${ENTRY_TIMEOUT_MS}ms, RETRIES=${RETRY_ERRORS}`);
 });
 
 bot.onText(/^\/clean$/, async (msg) => {
@@ -201,7 +209,7 @@ bot.onText(/^\/status$/, async (msg) => {
       fileCount += files.length;
     }
   } catch {}
-  bot.sendMessage(chatId, `✅ Running.\nBatches: ${batchCount}\nFiles: ${fileCount}\nConcurrency: x${CONCURRENCY}`);
+  bot.sendMessage(chatId, `✅ Running.\nBatches: ${batchCount}\nFiles: ${fileCount}\nConcurrency: x${CONCURRENCY}\nEntry Spread: ${ENTRY_SPREAD_MS}ms`);
 });
 
 // ---------- /export ----------
@@ -264,12 +272,12 @@ bot.on('message', async (msg) => {
 
   await bot.sendMessage(
     chatId,
-    `🧾 Received ${parsed.length} lines • Valid: ${valid.length} • Skipped: ${invalid.length}\nStarting with concurrency x${CONCURRENCY}…`
+    `🧾 Received ${parsed.length} lines • Valid: ${valid.length} • Skipped: ${invalid.length}\nStarting with concurrency x${CONCURRENCY} and ${ENTRY_SPREAD_MS}ms spacing…`
   );
 
   // Live progress message
   let done = 0;
-  let validCount = 0, incorrectCount = 0, unknownCount = 0, errorCount = 0;
+  let validCount = 0, incorrectCount = 0, unknownCount = 0, blockedCount = 0, errorCount = 0;
   const total = valid.length;
 
   const progressMsg = await bot.sendMessage(chatId, `⏳ 0/${total} done`);
@@ -291,6 +299,10 @@ bot.on('message', async (msg) => {
     while (true) {
       pass++;
       try {
+        // jittered delay before each attempt to reduce burstiness
+        const jitter = Math.floor(ENTRY_SPREAD_MS * (0.6 + Math.random() * 0.8));
+        if (ENTRY_SPREAD_MS > 0) await delay(jitter);
+
         const shotName = `${String(entry.index).padStart(3,'0')}_${entry.lastName.replace(/\s+/g,'_')}_${entry.last4}.jpg`;
         const shotPath = path.join(batchDir, shotName);
 
@@ -299,10 +311,11 @@ bot.on('message', async (msg) => {
           new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ENTRY_TIMEOUT_MS))
         ]);
 
-        if (status === 'valid') validCount++;
+        if (status === 'valid')        validCount++;
         else if (status === 'incorrect') incorrectCount++;
-        else if (status === 'unknown') unknownCount++;
-        else errorCount++;
+        else if (status === 'unknown')   unknownCount++;
+        else if (status === 'blocked')   blockedCount++;
+        else                             errorCount++;
 
         return { index: entry.index, input: entry.input, ok: true, status, screenshot: savedPath || shotPath, error };
       } catch (err) {
@@ -333,14 +346,15 @@ bot.on('message', async (msg) => {
       valid: valid.length,
       invalid: invalid.length,
       concurrency: CONCURRENCY,
-      retries: RETRY_ERRORS
+      retries: RETRY_ERRORS,
+      spacing_ms: ENTRY_SPREAD_MS
     },
     invalid,
     results
   }, null, 2));
 
   const errorReasons = results
-    .filter(r => !r.ok || r.status === 'error')
+    .filter(r => !r.ok || r.status === 'error' || r.status === 'blocked')
     .map(r => (r.error || '').slice(0, 200))
     .filter(Boolean)
     .slice(0, 3);
@@ -354,6 +368,7 @@ bot.on('message', async (msg) => {
 `✅ Valid: ${validCount}
 ❌ Incorrect: ${incorrectCount}
 ❓ Unknown: ${unknownCount}
+🛡️ Blocked (WAF): ${blockedCount}
 ⚠️ Errors: ${errorCount}
 ⛔ Invalid: ${invalid.length}` + reasonsBlock;
 
