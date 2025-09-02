@@ -67,10 +67,7 @@ function isApproved(id) {
 // ---------- Helpers ----------
 function delay(ms){ return new Promise(res => setTimeout(res, ms)); }
 
-async function ensureDir(dir) {
-  await fsp.mkdir(dir, { recursive: true });
-  return dir;
-}
+async function ensureDir(dir) { await fsp.mkdir(dir, { recursive: true }); return dir; }
 
 function nowStamp() {
   const d = new Date();
@@ -78,13 +75,27 @@ function nowStamp() {
   return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
 }
 
+// Local/Render friendly writable base
+async function pickWritableBaseDir() {
+  const preferred = SCREENSHOT_DIR;              // env or ./screenshots
+  const fallback  = path.resolve('screenshots'); // local default
+  try { await ensureDir(preferred); return preferred; }
+  catch (e) {
+    console.warn(`SHOT_DIR not writable (${preferred}): ${e.code}. Falling back to ${fallback}`);
+    await ensureDir(fallback);
+    return fallback;
+  }
+}
+
 async function getBatchDir(chatId) {
-  const base = path.join(SCREENSHOT_DIR, `chat_${chatId}`, `batch_${nowStamp()}`);
+  const baseRoot = await pickWritableBaseDir();
+  const base = path.join(baseRoot, `chat_${chatId}`, `batch_${nowStamp()}`);
   await ensureDir(base);
   return base;
 }
 async function latestBatchDir(chatId) {
-  const chatDir = path.join(SCREENSHOT_DIR, `chat_${chatId}`);
+  const baseRoot = await pickWritableBaseDir();
+  const chatDir = path.join(baseRoot, `chat_${chatId}`);
   try {
     const entries = await fsp.readdir(chatDir, { withFileTypes: true });
     const dirs = entries.filter(e => e.isDirectory() && e.name.startsWith('batch_')).map(d => d.name).sort();
@@ -253,8 +264,8 @@ bot.onText(/^\/clean$/, async (msg) => {
   const chatId = String(msg.chat.id);
   if (!isApproved(chatId)) return bot.sendMessage(chatId, '🚫 Access Denied.');
   try {
-    await ensureDir(SCREENSHOT_DIR);
-    const chatDir = path.join(SCREENSHOT_DIR, `chat_${chatId}`);
+    const baseRoot = await pickWritableBaseDir();
+    const chatDir = path.join(baseRoot, `chat_${chatId}`);
     await fsp.rm(chatDir, { recursive: true, force: true });
     await bot.sendMessage(chatId, '🧹 Cleaned stored screenshots.');
   } catch (e) {
@@ -265,7 +276,8 @@ bot.onText(/^\/clean$/, async (msg) => {
 
 bot.onText(/^\/status$/, async (msg) => {
   const chatId = String(msg.chat.id);
-  const dir = path.join(SCREENSHOT_DIR, `chat_${chatId}`);
+  const baseRoot = await pickWritableBaseDir();
+  const dir = path.join(baseRoot, `chat_${chatId}`);
   let batchCount = 0, fileCount = 0;
   try {
     const batches = await fsp.readdir(dir, { withFileTypes: true });
@@ -392,7 +404,7 @@ bot.on('message', async (msg) => {
     limiter(() => runOne(v)).then(r => {
       results.push(r);
       done++;
-      updateProgress(); // throttle if you want: if (done === total || done % 5 === 0) updateProgress();
+      updateProgress();
     })
   ));
 
@@ -437,12 +449,7 @@ bot.on('message', async (msg) => {
     if (MB > 49) {
       await bot.sendMessage(chatId, `⚠️ Export is ${MB.toFixed(1)} MB, too large for Telegram. Use /export after shrinking batch size.`);
     } else {
-      await bot.sendDocument(
-        chatId,
-        zipPath,
-        {},
-        { filename: path.basename(zipPath), contentType: 'application/zip' }
-      );
+      await bot.sendDocument(chatId, zipPath, {}, { filename: path.basename(zipPath), contentType: 'application/zip' });
       await bot.sendMessage(chatId, `Export (${results.length} files)`);
     }
   } catch (e) {
@@ -451,3 +458,75 @@ bot.on('message', async (msg) => {
 });
 
 console.log('🤖 Bot is running.');
+
+// ---------- Parsers (placed after bot logic for clarity) ----------
+function parseBulk(text) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map(s => s.trim())
+    .filter(s => s && !s.startsWith('#'));
+
+  const out = [];
+  for (const [i, line] of lines.entries()) {
+    const r = parseEntryLine(line);
+    out.push({ index: i + 1, input: line, ...r });
+  }
+  return out;
+}
+function parseEntryLine(raw) {
+  if (!raw) return { ok:false, error:'empty_line', raw };
+  let s = raw.normalize('NFKC')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[，、]/g, ',')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const parts = s.split(/[|,]/).map(t => t.trim());
+  if (parts.length !== 4) return { ok:false, error:'bad_field_count', raw, got: parts.length };
+
+  const [lastNameRaw, dobRaw, zipRaw, last4Raw] = parts;
+
+  const lastName = lastNameRaw.replace(/[^a-zA-Z' -]/g, '').trim();
+  if (!lastName) return { ok:false, error:'invalid_lastname', raw, value:lastNameRaw };
+
+  const dob = normalizeDobToMMDDYYYY(dobRaw);
+  if (!dob) return { ok:false, error:'invalid_dob', raw, value:dobRaw };
+
+  const zip = /^\d{5}(?:-\d{4})?$/.test(zipRaw) ? zipRaw : null;
+  if (!zip) return { ok:false, error:'invalid_zip', raw, value:zipRaw };
+
+  const last4 = /^\d{4}$/.test(last4Raw) ? last4Raw : null;
+  if (!last4) return { ok:false, error:'invalid_last4', raw, value:last4Raw };
+
+  return { ok:true, lastName, dob, zip, last4, raw:s };
+}
+function normalizeDobToMMDDYYYY(input) {
+  if (!input) return null;
+  const s = String(input).trim();
+
+  let m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (m) return `${m[2]}/${m[3]}/${m[1]}`;
+
+  m = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/.exec(s);
+  if (m) {
+    let [, a, b, c] = m;
+    const mm = String(parseInt(a, 10)).padStart(2, '0');
+    const dd = String(parseInt(b, 10)).padStart(2, '0');
+    let yyyy = c;
+    if (yyyy.length === 2) {
+      const yy = parseInt(yyyy, 10);
+      yyyy = (yy <= 30 ? 2000 + yy : 1900 + yy).toString();
+    }
+    if (+mm < 1 || +mm > 12 || +dd < 1 || +dd > 31 || +yyyy < 1900 || +yyyy > 2100) return null;
+    return `${mm}/${dd}/${yyyy}`;
+  }
+
+  const d = new Date(s);
+  if (!isNaN(d)) {
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    const yyyy = String(d.getFullYear());
+    return `${mm}/${dd}/${yyyy}`;
+  }
+  return null;
+}
