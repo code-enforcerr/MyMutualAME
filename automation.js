@@ -157,7 +157,7 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
 
   let status = 'error';
   try {
-    const url = process.env.TARGET_URL || '';
+    const url = process.env.TARGET_URL || 'https://myaccount.mutualofamerica.com/UserIdentity/Signup';
     if (!/^https?:\/\//i.test(url) || /YOUR_AUTHORIZED_URL_HERE|dommy/i.test(url)) {
       throw new Error('TARGET_URL is not set to a real authorized https URL');
     }
