@@ -23,13 +23,12 @@ if (!process.env.TELEGRAM_TOKEN) {
   process.exit(1);
 }
 
-// Start with polling disabled; we'll delete webhook then start polling to avoid 409s.
+// Start with polling disabled; delete webhook then start polling to avoid 409s
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: false });
 
-// Ensure we own the connection: kill webhook, then start polling cleanly
 (async () => {
   try {
-    await bot.deleteWebHook({ drop_pending_updates: true }); // also clears any backlog
+    await bot.deleteWebHook({ drop_pending_updates: true });
     try { await bot.stopPolling(); } catch {}
     await bot.startPolling({ params: { allowed_updates: ['message'] } });
     console.log('🤖 Bot is running (polling started cleanly).');
@@ -57,11 +56,11 @@ bot.on('polling_error', async (err) => {
   }
 });
 
-// --- Parse approved users from env (strings) ---
-const rawApproved = (process.env.APPROVED_USERS || '').trim(); // e.g. "8134029062,123456789"
+// --- Approved users from env ---
+const rawApproved = (process.env.APPROVED_USERS || '').trim(); // "123,456"
 const approvedUsers = rawApproved.split(',').map(s => s.trim()).filter(Boolean);
-function isApproved(chatIdOrUserId) {
-  const idStr = String(chatIdOrUserId).trim();
+function isApproved(id) {
+  const idStr = String(id).trim();
   return approvedUsers.length === 0 || approvedUsers.includes(idStr);
 }
 
@@ -103,7 +102,7 @@ async function zipDirectory(sourceDir, outPath) {
     output.on('close', () => resolve(outPath));
     archive.on('error', reject);
 
-    // Safety: skip any .zip files inside the source directory
+    // Skip any .zip files inside the folder (safety)
     archive.directory(sourceDir, false, { filter: file => !/\.zip$/i.test(file) });
     archive.pipe(output);
     archive.finalize();
@@ -111,17 +110,14 @@ async function zipDirectory(sourceDir, outPath) {
 }
 
 // ---------- Intake (NEW FORMAT) ----------
-// One line (comma OR pipe):
-//   LASTNAME,DOB,ZIP,LAST4
+// LASTNAME,DOB,ZIP,LAST4
 function normalizeDobToMMDDYYYY(input) {
   if (!input) return null;
   const s = String(input).trim();
 
-  // YYYY-MM-DD -> MM/DD/YYYY
   let m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
   if (m) return `${m[2]}/${m[3]}/${m[1]}`;
 
-  // M/D/YY(YY) or MM-DD-YYYY
   m = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/.exec(s);
   if (m) {
     let [, a, b, c] = m;
@@ -136,7 +132,6 @@ function normalizeDobToMMDDYYYY(input) {
     return `${mm}/${dd}/${yyyy}`;
   }
 
-  // Fallback to Date()
   const d = new Date(s);
   if (!isNaN(d)) {
     const mm = String(d.getMonth() + 1).padStart(2, '0');
@@ -376,7 +371,6 @@ bot.on('message', async (msg) => {
           new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ENTRY_TIMEOUT_MS))
         ]);
 
-        // Tally
         if (status === 'valid') validCount++;
         else if (status === 'incorrect') incorrectCount++;
         else if (status === 'unknown') unknownCount++;
@@ -398,7 +392,7 @@ bot.on('message', async (msg) => {
     limiter(() => runOne(v)).then(r => {
       results.push(r);
       done++;
-      updateProgress(); // if needed, throttle: if (done === total || done % 5 === 0) updateProgress();
+      updateProgress(); // throttle if you want: if (done === total || done % 5 === 0) updateProgress();
     })
   ));
 
@@ -417,7 +411,7 @@ bot.on('message', async (msg) => {
     results
   }, null, 2));
 
-  // Final summary (like your screenshot)
+  // Final summary
   const finalSummary =
 `✅ Valid: ${validCount}
 ❌ Incorrect: ${incorrectCount}
@@ -425,17 +419,15 @@ bot.on('message', async (msg) => {
 ⚠️ Errors: ${errorCount}
 ⛔ Invalid: ${invalid.length}`;
 
-  // Replace the ticker with the final "done"
   try {
     await bot.editMessageText(`✅ ${total}/${total} done`, { chat_id: progressIdent.chat_id, message_id: progressIdent.message_id });
   } catch {}
 
-  // Send the summary as a separate message (emojis + line breaks)
   await bot.sendMessage(chatId, finalSummary);
 
-  // Auto-export ZIP (write OUTSIDE the batch folder to avoid zip-in-zip)
+  // Auto-export ZIP (write OUTSIDE the batch folder)
   try {
-    const parentDir = path.join(batchDir, '..');     // safe: not inside the folder being zipped
+    const parentDir = path.join(batchDir, '..');
     await ensureDir(parentDir);
     const zipPath = path.join(parentDir, `export_${Date.now()}.zip`);
 

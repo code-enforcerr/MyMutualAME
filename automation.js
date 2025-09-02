@@ -6,8 +6,6 @@ const path = require('path');
 
 let _browser = null;
 
-// Viewport tuned so the panel renders at a similar scale to your sample.
-// You can tweak via env if needed.
 const VIEWPORT_W = parseInt(process.env.VIEWPORT_W || '800', 10);
 const VIEWPORT_H = parseInt(process.env.VIEWPORT_H || '980', 10);
 const JPEG_QUALITY = Math.min(95, Math.max(30, parseInt(process.env.JPEG_QUALITY || '70', 10)));
@@ -28,7 +26,6 @@ function sanitize(s = '') { return String(s).replace(/[^a-z0-9._-]/gi, '_'); }
 async function ensureWritablePath(p) { await fsp.mkdir(path.dirname(p), { recursive: true }); return p; }
 function withUniqueSuffix(p) { const ext = path.extname(p) || '.jpg'; const base = p.slice(0, -ext.length); return `${base}_${ts()}${ext}`; }
 
-// Accept common forms and normalize to MM/DD/YYYY
 function normalizeDOB(input) {
   if (!input) return '';
   const s = String(input).trim();
@@ -65,9 +62,9 @@ async function tryClickContinue(page) {
   for (const sel of candidates) {
     try {
       const b = page.locator(sel).first();
-      await b.waitFor({ state: 'visible', timeout: 4000 });
+      await b.waitFor({ state: 'visible', timeout: 5000 });
       await b.scrollIntoViewIfNeeded().catch(()=>{});
-      await b.click({ timeout: 4000 });
+      await b.click({ timeout: 5000 });
       return true;
     } catch {}
   }
@@ -78,26 +75,23 @@ async function tryFill(page, selectors, value) {
   for (const sel of selectors) {
     try {
       const el = page.locator(sel).first();
-      await el.waitFor({ state: 'visible', timeout: 4000 });
+      await el.waitFor({ state: 'visible', timeout: 5000 });
       await el.scrollIntoViewIfNeeded().catch(()=>{});
-      await el.click({ timeout: 2000 }).catch(()=>{});
-      await el.fill(''); // clear first
-      await el.type(String(value), { delay: 30 });
+      await el.click({ timeout: 2500 }).catch(()=>{});
+      await el.fill('');
+      await el.type(String(value), { delay: 25 });
       return true;
     } catch {}
   }
   return false;
 }
 
-// NEW: take a screenshot of exactly the central panel (alert + inputs + buttons)
+// Panel-exact screenshot (alert + inputs + buttons)
 async function screenshotPanel(page, outPath) {
-  // Prefer a form that contains the Continue button
   let target = page.locator('form:has(button:has-text("Continue"))').first();
   try {
-    await target.waitFor({ state: 'visible', timeout: 4000 });
+    await target.waitFor({ state: 'visible', timeout: 6000 });
 
-    // Many sites wrap the form in a panel <div> that also contains the red alert.
-    // Jump one level up if that parent contains a heading/alert; this matches your sample.
     const parent = target.locator('..');
     try {
       const hasAlert = await parent.locator('text=/unable to confirm your identity/i').count();
@@ -108,13 +102,12 @@ async function screenshotPanel(page, outPath) {
     await target.screenshot({ path: outPath, type: 'jpeg', quality: JPEG_QUALITY });
     return outPath;
   } catch {
-    // Fallback: visible viewport (not full page)
     await page.screenshot({ path: outPath, type: 'jpeg', quality: JPEG_QUALITY, fullPage: false });
     return outPath;
   }
 }
 
-// Result classifier — maps the red alert to "incorrect"
+// Result classifier
 async function classifyResult(page) {
   const incorrectMatchers = [
     /We are unable to confirm your identity/i,
@@ -124,9 +117,12 @@ async function classifyResult(page) {
   ];
   for (const re of incorrectMatchers) {
     if (await page.locator(`text=/${re.source}/`).first().isVisible().catch(() => false)) return 'incorrect';
-    const alert = page.locator('[role="alert"], .alert, .alert-danger, .usa-alert').filter({ hasText: re });
-    if (await alert.first().isVisible().catch(() => false)) return 'incorrect';
   }
+  try {
+    const alertVis = await page.locator('[role="alert"], .alert, .alert-danger, .usa-alert').first().isVisible({ timeout: 2000 });
+    if (alertVis) return 'incorrect';
+  } catch {}
+
   const validMatchers = [
     /verified/i, /success/i, /we found your account/i, /security code/i, /verification code/i
   ];
@@ -146,12 +142,8 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36'
   });
 
-  // Keep it fast, but don't block fonts/CSS (labels can depend on webfonts)
-  await context.route('**/*', (route) => {
-    const t = route.request().resourceType();
-    if (t === 'media' || t === 'image') return route.abort(); // allow fonts & css
-    return route.continue();
-  });
+  // Do NOT block resources (fonts/images/css sometimes required)
+  await context.route('**/*', (route) => route.continue());
 
   const page = await context.newPage();
 
@@ -171,8 +163,10 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
     }
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+    try { await page.waitForLoadState('networkidle', { timeout: 7000 }); } catch {}
+    try { await page.locator('text=/Verify your Identity/i').first().waitFor({ timeout: 6000 }); } catch {}
 
-    // Fill the four fields (labels/placeholders matching your UI)
     const okLast = await tryFill(page, [
       'label:has-text("Last Name") ~ input',
       'input[placeholder*="Last Name" i]',
@@ -211,11 +205,9 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
     const clicked = await tryClickContinue(page);
     if (!clicked) throw new Error('Could not find the Continue button');
 
-    // Give the page time to respond and render any alert
     try { await page.waitForLoadState('networkidle', { timeout: 4000 }); } catch {}
     await page.waitForTimeout(1200);
 
-    // Try to classify outcome for a few cycles
     const deadline = Date.now() + RESULT_TIMEOUT_MS;
     while (Date.now() < deadline) {
       const c = await classifyResult(page);
@@ -224,17 +216,17 @@ async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
     }
     if (status === 'error' || status === 'unknown') status = await classifyResult(page);
 
-    // EXACT PANEL SHOT (alert + inputs + buttons)
     await screenshotPanel(page, shotPath);
 
     return { status, screenshotPath: shotPath };
   } catch (err) {
     const reason = err?.message || String(err);
     try {
-      // Fallback: capture viewport + write a small note for debugging
       await page.screenshot({ path: shotPath, type: 'jpeg', quality: JPEG_QUALITY, fullPage: false });
       const notePath = shotPath.replace(/\.jpe?g$/i, '.txt');
       await fsp.writeFile(notePath, `Error: ${reason}\nURL: ${await page.url().catch(()=>'?')}\n`, 'utf8');
+      const htmlPath = shotPath.replace(/\.jpe?g$/i, '.html');
+      await fsp.writeFile(htmlPath, await page.content(), 'utf8');
     } catch {}
     return { status: 'error', screenshotPath: shotPath, error: reason };
   } finally {
