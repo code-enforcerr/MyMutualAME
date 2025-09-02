@@ -1,4 +1,8 @@
 // automation.js
+// Place BEFORE requiring playwright
+if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
+  process.env.PLAYWRIGHT_BROWSERS_PATH = '0';
+}
 const { chromium } = require('playwright');
 const fs = require('fs');
 const fsp = fs.promises;
@@ -15,6 +19,13 @@ const RESULT_TIMEOUT_MS = parseInt(process.env.RESULT_TIMEOUT_MS || '20000', 10)
 const ENABLE_TRACE = String(process.env.TRACE || '').trim() === '1';
 
 async function getBrowser() {
+  // Debug log to confirm where the binary is
+  try {
+    const exe = chromium.executablePath ? chromium.executablePath() : '(no method)';
+    console.log('Playwright chromium executablePath =', exe);
+    console.log('PLAYWRIGHT_BROWSERS_PATH =', process.env.PLAYWRIGHT_BROWSERS_PATH || '(unset)');
+  } catch {}
+
   if (_browser && _browser.isConnected()) return _browser;
   _browser = await chromium.launch({
     headless: true,
