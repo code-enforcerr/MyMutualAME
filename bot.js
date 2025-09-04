@@ -11,9 +11,9 @@ const { runAutomation } = require('./automation');
 // ================== Config knobs (env-overridable) ==================
 const MAX_ENTRIES       = parseInt(process.env.MAX_ENTRIES || '70', 10);
 const CONCURRENCY       = parseInt(process.env.CONCURRENCY || '1', 10);       // default 1 (gentle); override via env
-const ENTRY_TIMEOUT_MS  = parseInt(process.env.ENTRY_TIMEOUT_MS || '80000', 10);
-const RETRY_ERRORS      = parseInt(process.env.RETRY_ERRORS || '1', 10);      // retry passes after the first run
-const RETRY_DELAY_MS    = parseInt(process.env.RETRY_DELAY_MS || '2000', 10); // ms between retry passes
+const ENTRY_TIMEOUT_MS  = parseInt(process.env.ENTRY_TIMEOUT_MS || '30000', 10); // 30s timeout
+const RETRY_ERRORS      = 0;                                                   // disabled
+const RETRY_DELAY_MS    = parseInt(process.env.RETRY_DELAY_MS || '2000', 10);  // irrelevant if no retries
 const OUTPUT_ROOT       = process.env.OUTPUT_ROOT || path.join(__dirname, 'screenshots');
 // ===================================================================
 
@@ -24,6 +24,8 @@ if (!process.env.TELEGRAM_TOKEN) {
 }
 
 console.log('⚙️  CONCURRENCY =', CONCURRENCY);
+console.log('⏱️  ENTRY_TIMEOUT_MS =', ENTRY_TIMEOUT_MS);
+console.log('🔁 RETRY_ERRORS =', RETRY_ERRORS);
 
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
 
@@ -307,33 +309,39 @@ bot.on('message', async msg => {
   // for later reporting files
   const byIndex = new Map(valid.map(v => [v.index, v]));
 
-  // --- SINGLE-LINE PROGRESS COUNTER ---
+  // --- SINGLE-LINE PROGRESS COUNTER + HEARTBEAT ---
   let progressMsg = await bot.sendMessage(chatId, `⏳ Progress 0/${valid.length}`);
   let done = 0;
 
+  // Heartbeat keeps the line alive even before first completion
+  let beat = 0;
+  const heartbeat = setInterval(async () => {
+    try {
+      const dots = '.'.repeat((beat % 3) + 1); // ., .., ...
+      await bot.editMessageText(
+        `⏳ Progress ${done}/${valid.length} ${dots}`,
+        { chat_id: chatId, message_id: progressMsg.message_id }
+      );
+      beat++;
+    } catch (_) {}
+  }, 5000);
+
   const limiter = createLimiter(CONCURRENCY);
 
-  // Internal runner with retry passes
+  // Internal runner: single attempt (no retry), 30s timeout (ENTRY_TIMEOUT_MS)
   async function runOne(entry) {
-    let pass = 0;
-    while (true) {
-      pass++;
-      try {
-        const shotName = `${String(entry.index).padStart(3,'0')}_${entry.lastName.replace(/\s+/g,'_')}_${entry.last4}.jpg`;
-        const shotPath = path.join(batchDir, shotName);
+    try {
+      const shotName = `${String(entry.index).padStart(3,'0')}_${entry.lastName.replace(/\s+/g,'_')}_${entry.last4}.jpg`;
+      const shotPath = path.join(batchDir, shotName);
 
-        const { status, screenshotPath: savedPath } = await Promise.race([
-          runAutomation(entry.lastName, entry.dob, entry.zip, entry.last4, shotPath),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ENTRY_TIMEOUT_MS))
-        ]);
+      const { status, screenshotPath: savedPath } = await Promise.race([
+        runAutomation(entry.lastName, entry.dob, entry.zip, entry.last4, shotPath),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ENTRY_TIMEOUT_MS))
+      ]);
 
-        return { index: entry.index, input: entry.input, ok: true, status, screenshot: savedPath || shotPath };
-      } catch (err) {
-        if (pass > 1 + RETRY_ERRORS) {
-          return { index: entry.index, input: entry.input, ok: false, error: String(err && err.message || err) };
-        }
-        await delay(RETRY_DELAY_MS);
-      }
+      return { index: entry.index, input: entry.input, ok: true, status, screenshot: savedPath || shotPath };
+    } catch (err) {
+      return { index: entry.index, input: entry.input, ok: false, error: String(err && err.message || err) };
     }
   }
 
@@ -348,7 +356,7 @@ bot.on('message', async msg => {
       const r = await runOne(v);
       results.push(r);
 
-      // update single-line progress
+      // update single-line progress on completion
       done++;
       try {
         await bot.editMessageText(
@@ -361,6 +369,9 @@ bot.on('message', async msg => {
     })
   ));
 
+  // Stop heartbeat
+  clearInterval(heartbeat);
+
   // ---------- Companion report files ----------
   const allCsvPath    = path.join(batchDir, 'all_results.csv');
   const failedTxtPath = path.join(batchDir, 'failed.txt');
@@ -368,7 +379,6 @@ bot.on('message', async msg => {
   const csvEscape = (v = '') => {
     const s = String(v);
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    // returns quoted if needed
   };
 
   // ALL results CSV
@@ -407,7 +417,8 @@ bot.on('message', async msg => {
       valid: valid.length,
       invalid: invalid.length,
       concurrency: CONCURRENCY,
-      retries: RETRY_ERRORS
+      retries: RETRY_ERRORS,
+      timeout_ms: ENTRY_TIMEOUT_MS
     },
     invalid,
     results
@@ -415,8 +426,18 @@ bot.on('message', async msg => {
 
   const failedIdx = results.filter(r => !r.ok).map(r => r.index).join(', ');
   const extra = failedIdx
-    ? `\nFailed indices: ${failedIdx}\nUse /export to get failed.txt & all_results.csv`
-    : `\nUse /export to download the zip of this batch.`;
+    ? `\nFailed indices: ${failedIdx}\nFiles attached: failed.txt & all_results.csv\nUse /export to also get results.zip`
+    : `\nFiles attached: all_results.csv\nUse /export to also get results.zip`;
+
+  // --- Auto-attach companion files right away ---
+  try {
+    await bot.sendDocument(chatId, allCsvPath, {}, { filename: 'all_results.csv', contentType: 'text/csv' });
+  } catch {}
+  if (failed.length) {
+    try {
+      await bot.sendDocument(chatId, failedTxtPath, {}, { filename: 'failed.txt', contentType: 'text/plain' });
+    } catch {}
+  }
 
   await bot.sendMessage(chatId, `🎉 Done. Success: ${results.filter(r=>r.ok).length} • Failed: ${results.filter(r=>!r.ok).length}${extra}`);
 });
