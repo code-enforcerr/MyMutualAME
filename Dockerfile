@@ -12,9 +12,11 @@ COPY . .
 # Writeable path (pair with Render Disk if you want persistence)
 RUN mkdir -p /data/screenshots && chown -R pwuser:pwuser /data /app
 
+# Use browsers that come with the Playwright image
 ENV NODE_ENV=production \
     OUTPUT_ROOT=/data/screenshots \
-    PLAYWRIGHT_BROWSERS_PATH=0
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 USER pwuser
 
