@@ -243,6 +243,13 @@ bot.onText(/^\/export/i, async msg => {
       return bot.sendMessage(chatId, `⚠️ Export is ${MB.toFixed(1)} MB, too large for Telegram. Please reduce batch size.`);
     }
     await bot.sendDocument(chatId, zipPath, {}, { filename: 'results.zip', contentType: 'application/zip' });
+
+    // Also try to send companion files if present
+    const failedTxt = path.join(dir, 'failed.txt');
+    const allCsv    = path.join(dir, 'all_results.csv');
+    try { await fsp.access(failedTxt); await bot.sendDocument(chatId, failedTxt, {}, { filename: 'failed.txt', contentType: 'text/plain' }); } catch {}
+    try { await fsp.access(allCsv);    await bot.sendDocument(chatId, allCsv,    {}, { filename: 'all_results.csv', contentType: 'text/csv' }); } catch {}
+
   } catch (e) {
     await bot.sendMessage(chatId, `Export failed: ${e.message}`);
   }
@@ -296,6 +303,9 @@ bot.on('message', async msg => {
   const resultsJsonPath = path.join(batchDir, 'results.json');
 
   await bot.sendMessage(chatId, `🧾 Received ${parsed.length} lines • Valid: ${valid.length} • Skipped: ${invalid.length}\nStarting ${valid.length} entries with concurrency x${CONCURRENCY}…`);
+
+  // for later reporting files
+  const byIndex = new Map(valid.map(v => [v.index, v]));
 
   // --- SINGLE-LINE PROGRESS COUNTER ---
   let progressMsg = await bot.sendMessage(chatId, `⏳ Progress 0/${valid.length}`);
@@ -351,7 +361,44 @@ bot.on('message', async msg => {
     })
   ));
 
-  // Write results
+  // ---------- Companion report files ----------
+  const allCsvPath    = path.join(batchDir, 'all_results.csv');
+  const failedTxtPath = path.join(batchDir, 'failed.txt');
+
+  const csvEscape = (v = '') => {
+    const s = String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    // returns quoted if needed
+  };
+
+  // ALL results CSV
+  const allHeader = 'index,status,lastName,dob,zip,last4,error,input\n';
+  const allLines = results.map(r => {
+    const rec = byIndex.get(r.index) || {};
+    return [
+      r.index,
+      r.ok ? r.status : 'error',
+      rec.lastName || '',
+      rec.dob || '',
+      rec.zip || '',
+      rec.last4 || '',
+      r.ok ? '' : (r.error || ''),
+      rec.input || r.input || ''
+    ].map(csvEscape).join(',');
+  });
+  await fsp.writeFile(allCsvPath, allHeader + allLines.join('\n') + '\n');
+
+  // FAILED lines TXT
+  const failed = results.filter(r => !r.ok);
+  if (failed.length) {
+    const failLines = failed.map(r => {
+      const rec = byIndex.get(r.index) || {};
+      return `${r.index}\t${rec.input || r.input}\t${(r.error || 'error')}`;
+    }).join('\n');
+    await fsp.writeFile(failedTxtPath, failLines + '\n');
+  }
+
+  // Write JSON results
   results.sort((a,b) => a.index - b.index);
   await fsp.writeFile(resultsJsonPath, JSON.stringify({
     meta: {
@@ -366,7 +413,12 @@ bot.on('message', async msg => {
     results
   }, null, 2));
 
-  await bot.sendMessage(chatId, `🎉 Done. Success: ${results.filter(r=>r.ok).length} • Failed: ${results.filter(r=>!r.ok).length}\nUse /export to download the zip of this batch.`);
+  const failedIdx = results.filter(r => !r.ok).map(r => r.index).join(', ');
+  const extra = failedIdx
+    ? `\nFailed indices: ${failedIdx}\nUse /export to get failed.txt & all_results.csv`
+    : `\nUse /export to download the zip of this batch.`;
+
+  await bot.sendMessage(chatId, `🎉 Done. Success: ${results.filter(r=>r.ok).length} • Failed: ${results.filter(r=>!r.ok).length}${extra}`);
 });
 
 console.log('🤖 Bot is running.');
