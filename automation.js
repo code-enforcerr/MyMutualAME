@@ -1,87 +1,106 @@
 // automation.js
-// Place BEFORE requiring playwright
-if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
-  process.env.PLAYWRIGHT_BROWSERS_PATH = '0';
-}
-const { chromium } = require('playwright');
+const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
-const path = require('path');
+const { chromium } = require('playwright');
 
 let _browser = null;
 
-const VIEWPORT_W = parseInt(process.env.VIEWPORT_W || '800', 10);
-const VIEWPORT_H = parseInt(process.env.VIEWPORT_H || '980', 10);
-const JPEG_QUALITY = Math.min(95, Math.max(30, parseInt(process.env.JPEG_QUALITY || '70', 10)));
-// Bump result window to be more forgiving
-const RESULT_TIMEOUT_MS = parseInt(process.env.RESULT_TIMEOUT_MS || '20000', 10);
-// Enable per-run trace by setting TRACE=1
-const ENABLE_TRACE = String(process.env.TRACE || '').trim() === '1';
-
 async function getBrowser() {
-  // Debug log to confirm where the binary is
-  try {
-    const exe = chromium.executablePath ? chromium.executablePath() : '(no method)';
-    console.log('Playwright chromium executablePath =', exe);
-    console.log('PLAYWRIGHT_BROWSERS_PATH =', process.env.PLAYWRIGHT_BROWSERS_PATH || '(unset)');
-  } catch {}
-
   if (_browser && _browser.isConnected()) return _browser;
   _browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-blink-features=AutomationControlled']
+    args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
   });
   return _browser;
 }
 
-function ts() { return new Date().toISOString().replace(/[:.]/g, '-'); }
-function sanitize(s = '') { return String(s).replace(/[^a-z0-9._-]/gi, '_'); }
+function sanitizeFile(s) {
+  return String(s || '')
+    .replace(/[^\w.\-]+/g, '_')
+    .slice(0, 100);
+}
 
-async function ensureWritablePath(p) { await fsp.mkdir(path.dirname(p), { recursive: true }); return p; }
-function withUniqueSuffix(p) { const ext = path.extname(p) || '.jpg'; const base = p.slice(0, -ext.length); return `${base}_${ts()}${ext}`; }
+async function ensureWritablePath(p, suffix = '') {
+  await fsp.mkdir(path.dirname(p), { recursive: true });
+  const ext = path.extname(p) || '.jpg';
+  const base = path.basename(p, ext);
+  const safe = sanitizeFile(base + (suffix ? `_${suffix}` : '')) + ext;
+  return path.join(path.dirname(p), safe);
+}
 
+function withUniqueSuffix(p) {
+  const ext = path.extname(p) || '.jpg';
+  const base = p.slice(0, -ext.length);
+  const ts = Date.now();
+  return `${base}_${ts}${ext}`;
+}
+
+// Normalize to MM/DD/YYYY (similar to bot.js)
 function normalizeDOB(input) {
   if (!input) return '';
   const s = String(input).trim();
-  let m;
-  if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) return s;
-  if ((m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s))) return `${m[2]}/${m[3]}/${m[1]}`;
-  if ((m = /^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})$/.exec(s))) {
+
+  // YYYY-MM-DD
+  let m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (m) return `${m[2]}/${m[3]}/${m[1]}`;
+
+  // M/D/YY(YY) or MM-DD-YYYY
+  m = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/.exec(s);
+  if (m) {
     let [, a, b, c] = m;
-    const mm = String(parseInt(a,10)).padStart(2,'0');
-    const dd = String(parseInt(b,10)).padStart(2,'0');
+    const mm = String(parseInt(a, 10)).padStart(2, '0');
+    const dd = String(parseInt(b, 10)).padStart(2, '0');
     let yyyy = c;
-    if (yyyy.length === 2) yyyy = (parseInt(yyyy,10) <= 30 ? 2000 + parseInt(yyyy,10) : 1900 + parseInt(yyyy,10)).toString();
+    if (yyyy.length === 2) {
+      const yy = parseInt(yyyy, 10);
+      yyyy = (yy <= 30 ? 2000 + yy : 1900 + yy).toString();
+    }
     return `${mm}/${dd}/${yyyy}`;
   }
+
+  // Fallback
   const d = new Date(s);
-  if (!isNaN(d)) return `${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}/${d.getFullYear()}`;
+  if (!isNaN(d)) {
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    const yyyy = String(d.getFullYear());
+    return `${mm}/${dd}/${yyyy}`;
+  }
   return s;
 }
 
 async function uniqueShotPath(last4, zip) {
-  const dir = process.env.SHOT_DIR || path.resolve('screenshots');
-  await fsp.mkdir(dir, { recursive: true });
-  return path.join(dir, `shot_${sanitize(last4)}_${sanitize(zip)}.jpg`);
+  const name = `shot_${sanitizeFile(String(last4 || ''))}_${sanitizeFile(String(zip || ''))}.jpg`;
+  return path.join(process.cwd(), 'screenshots', name);
+}
+
+async function smartScreenshot(page, outPath) {
+  try {
+    await page.screenshot({ path: outPath, type: 'jpeg', fullPage: true, quality: 80 });
+  } catch {
+    await page.screenshot({ path: outPath, type: 'jpeg' });
+  }
+  return outPath;
 }
 
 async function tryClickContinue(page) {
   const candidates = [
     'button:has-text("Continue")',
-    'button:has-text("CONTINUE")',
-    'button:has-text("Next")',
     'input[type="submit"][value*="Continue" i]',
-    'input[type="submit"][value*="Next" i]',
     '[role="button"]:has-text("Continue")',
+    // broaden safely:
+    'button:has-text("Next")',
     '[role="button"]:has-text("Next")',
+    'button:has-text("Submit")',
+    'input[type="submit"]',
     'button[type="submit"]',
   ];
   for (const sel of candidates) {
     try {
       const b = page.locator(sel).first();
-      await b.waitFor({ state: 'visible', timeout: 5000 });
-      await b.scrollIntoViewIfNeeded().catch(()=>{});
-      await b.click({ timeout: 5000 });
+      await b.waitFor({ state: 'visible', timeout: 2500 });
+      await b.click({ timeout: 2500 });
       return true;
     } catch {}
   }
@@ -89,221 +108,129 @@ async function tryClickContinue(page) {
 }
 
 async function tryFill(page, selectors, value) {
+  const v = String(value ?? '');
   for (const sel of selectors) {
     try {
-      const el = page.locator(sel).first();
-      await el.waitFor({ state: 'visible', timeout: 5000 });
-      await el.scrollIntoViewIfNeeded().catch(()=>{});
-      await el.click({ timeout: 2500 }).catch(()=>{});
-      await el.fill('');
-      await el.type(String(value), { delay: 25 });
+      const loc = page.locator(sel).first();
+      await loc.waitFor({ state: 'visible', timeout: 3500 });
+      await loc.fill(v, { timeout: 3500 });
+      // small nudge for sites that validate on blur
+      try { await loc.press('Tab'); } catch {}
       return true;
     } catch {}
   }
   return false;
 }
 
-// Panel-exact screenshot (alert + inputs + buttons)
-async function screenshotPanel(page, outPath) {
-  let target = page.locator('form:has(button:has-text("Continue")), form:has(button:has-text("Next"))').first();
-  try {
-    await target.waitFor({ state: 'visible', timeout: 6000 });
-
-    const parent = target.locator('..');
-    try {
-      const hasAlert = await parent.locator('text=/unable to confirm your identity/i').count();
-      const hasHeading = await parent.locator('text=/Verify your Identity/i').count();
-      if (hasAlert || hasHeading) target = parent;
-    } catch {}
-
-    await target.screenshot({ path: outPath, type: 'jpeg', quality: JPEG_QUALITY });
-    return outPath;
-  } catch {
-    await page.screenshot({ path: outPath, type: 'jpeg', quality: JPEG_QUALITY, fullPage: false });
-    return outPath;
-  }
-}
-
-// Result classifier
-async function classifyResult(page) {
-  const incorrectMatchers = [
-    /We are unable to confirm your identity/i,
-    /could not verify/i,
-    /doesn[’']?t match/i,
-    /not match/i
-  ];
-  for (const re of incorrectMatchers) {
-    if (await page.locator(`text=/${re.source}/`).first().isVisible().catch(() => false)) return 'incorrect';
-  }
-  try {
-    const alertVis = await page.locator('[role="alert"], .alert, .alert-danger, .usa-alert').first().isVisible({ timeout: 2000 });
-    if (alertVis) return 'incorrect';
-  } catch {}
-
-  const validMatchers = [
-    /verified/i, /success/i, /we found your account/i, /security code/i, /verification code/i
-  ];
-  for (const re of validMatchers) {
-    if (await page.locator(`text=/${re.source}/`).first().isVisible().catch(() => false)) return 'valid';
-  }
-  return 'unknown';
-}
-
+// ---------- Main export ----------
 // Signature: (lastName, dob, zip, last4, screenshotPath?)
 async function runAutomation(lastName, dob, zip, last4, screenshotPath) {
   const browser = await getBrowser();
-
   const context = await browser.newContext({
-    viewport: { width: VIEWPORT_W, height: VIEWPORT_H },
-    deviceScaleFactor: 1.0,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36'
+    viewport: { width: 1280, height: 900 },
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36',
   });
-
-  // Optional tracing for deep debugging (set TRACE=1)
-  if (ENABLE_TRACE) {
-    try {
-      const tracesDir = process.env.TRACES_DIR || path.resolve('traces');
-      await fsp.mkdir(tracesDir, { recursive: true }).catch(()=>{});
-      await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
-    } catch {}
-  }
-
-  // Do NOT block resources (fonts/images/css sometimes required)
-  await context.route('**/*', (route) => route.continue());
-
+  // default timeouts to make failures return promptly (bot handles retries)
+  context.setDefaultTimeout?.(10000);
   const page = await context.newPage();
 
+  let status = 'error';
   let shotPath;
+
   if (screenshotPath) {
-    const ensured = await ensureWritablePath(screenshotPath);
-    shotPath = withUniqueSuffix(ensured);
+    const ensured = await ensureWritablePath(screenshotPath, 'shot');
+    shotPath = withUniqueSuffix(ensured); // avoids overwrite if multiple passes
   } else {
-    shotPath = withUniqueSuffix(await uniqueShotPath(last4, zip));
+    shotPath = await uniqueShotPath(last4, zip);
   }
 
-  let status = 'error';
   try {
-    const url = process.env.TARGET_URL || 'https://myaccount.mutualofamerica.com/UserIdentity/Signup';
-    if (!/^https?:\/\//i.test(url) || /YOUR_AUTHORIZED_URL_HERE|dommy/i.test(url)) {
-      throw new Error('TARGET_URL is not set to a real authorized https URL');
+    const url =
+      process.env.TARGET_URL ||
+      'https://myaccount.mutualofamerica.com/UserIdentity/Signup';
+
+    if (!/^https?:\/\//i.test(url)) {
+      throw new Error('TARGET_URL must be a valid https URL');
     }
 
+    // Go to page
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-    try { await page.waitForLoadState('networkidle', { timeout: 7000 }); } catch {}
+    try {
+      await page.locator('form').first().waitFor({ state: 'visible', timeout: 8000 });
+    } catch {}
 
-    // --- WAF / anti-bot detection (explicit) ---
-    const html = await page.content();
-    if (/Incapsula|Imperva|Access Denied|Request unsuccessful|Bot detected/i.test(html)) {
-      throw new Error('Blocked by anti-bot/WAF. The real form did not load.');
-    }
-
-    // --- Form preflight: verify fields exist before trying to fill ---
-    const hasLastName = await page.locator(
-      'label:has-text("Last Name"), label:has-text("Last name"), input[placeholder*="Last Name" i], input[name*="last" i], input[id*="last" i]'
-    ).first().count();
-    const hasDob = await page.locator(
-      'label:has-text("Date of Birth"), label:has-text("Date of birth"), input[placeholder*="mm/dd/yyyy" i], input[placeholder*="DOB" i], input[name*="dob" i], input[id*="dob" i]'
-    ).first().count();
-    const hasZip = await page.locator(
-      'label:has-text("US Zip Code"), label:has-text("ZIP Code"), input[placeholder*="Zip" i], input[name*="zip" i], input[id*="zip" i], input[name*="postal" i]'
-    ).first().count();
-    const hasL4  = await page.locator(
-      'label:has-text("Last 4 Digits of SSN"), label:has-text("Last 4"), input[placeholder*="Last 4" i], input[name*="last4" i], input[id*="last4" i], input[name*="ssn" i]'
-    ).first().count();
-
-    if (!hasLastName || !hasDob || !hasZip || !hasL4) {
-      throw new Error(`Form fields not found on page (last:${!!hasLastName} dob:${!!hasDob} zip:${!!hasZip} last4:${!!hasL4}). Check TARGET_URL and selectors.`);
-    }
-
-    // (Optional) some pages show a heading; not required to proceed
-    try { await page.locator('text=/Verify your Identity/i').first().waitFor({ timeout: 6000 }); } catch {}
-
-    // Fill fields with broadened selectors
+    // Fill fields
     const okLast = await tryFill(page, [
       'label:has-text("Last Name") ~ input',
-      'label:has-text("Last name") ~ input',
       'input[placeholder*="Last Name" i]',
       'input[name*="last" i]',
-      'input[id*="last" i]'
+      'input[id*="last" i]',
     ], String(lastName).trim());
 
     const okDOB = await tryFill(page, [
       'label:has-text("Date of Birth") ~ input',
-      'label:has-text("Date of birth") ~ input',
-      'input[placeholder*="mm/dd/yyyy" i]',
+      'input[placeholder*="Date of Birth" i]',
       'input[placeholder*="DOB" i]',
       'input[name*="dob" i]',
-      'input[id*="dob" i]'
+      'input[id*="dob" i]',
     ], normalizeDOB(dob));
 
     const okZIP = await tryFill(page, [
-      'label:has-text("US Zip Code") ~ input',
-      'label:has-text("ZIP Code") ~ input',
+      'label:has-text("Zip") ~ input',
       'input[placeholder*="Zip" i]',
       'input[name*="zip" i]',
       'input[id*="zip" i]',
-      'input[name*="postal" i]'
+      'input[name*="postal" i]',
     ], String(zip).trim());
 
     const okL4 = await tryFill(page, [
-      'label:has-text("Last 4 Digits of SSN") ~ input',
       'label:has-text("Last 4") ~ input',
+      'label:has-text("Last 4 Digits of SSN") ~ input',
       'input[placeholder*="Last 4" i]',
       'input[name*="last4" i]',
       'input[id*="last4" i]',
-      'input[name*="ssn" i]'
+      'input[name*="ssn" i][maxlength="4"]',
+      'input[name*="ssn" i][aria-label*="Last 4" i]',
     ], String(last4).trim());
 
     if (!okLast || !okDOB || !okZIP || !okL4) {
-      throw new Error(`Could not locate all fields (last:${okLast} dob:${okDOB} zip:${okZIP} last4:${okL4})`);
+      throw new Error(
+        `Could not locate all fields (last:${okLast} dob:${okDOB} zip:${okZIP} last4:${okL4})`
+      );
     }
 
+    // Submit
     const clicked = await tryClickContinue(page);
-    if (!clicked) throw new Error('Could not find the Continue/Next button');
+    if (!clicked) throw new Error('Could not find a Continue/Next/Submit button');
 
-    try { await page.waitForLoadState('networkidle', { timeout: 4000 }); } catch {}
-    await page.waitForTimeout(1200);
+    // Observe outcome (adjust strings/selectors to your target page)
+    await page.waitForTimeout(1500);
+    const outcome = await Promise.race([
+      page.locator('text=/success|verified|matches/i').first().waitFor({ timeout: 6000 }).then(() => 'valid').catch(() => null),
+      page.locator('text=/invalid|not match|could not verify|doesn\'t match/i').first().waitFor({ timeout: 6000 }).then(() => 'incorrect').catch(() => null),
+      page.waitForTimeout(6500).then(() => 'unknown'),
+    ]);
+    status = outcome || 'unknown';
 
-    // Wait for a result (valid/incorrect), up to RESULT_TIMEOUT_MS
-    const deadline = Date.now() + RESULT_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      const c = await classifyResult(page);
-      if (c !== 'unknown') { status = c; break; }
-      await page.waitForTimeout(250);
-    }
-    if (status === 'error' || status === 'unknown') status = await classifyResult(page);
-
-    await screenshotPanel(page, shotPath);
-
-    // Save trace if enabled
-    if (ENABLE_TRACE) {
-      const tracePath = path.join(path.dirname(shotPath), path.basename(shotPath).replace(/\.jpe?g$/i, '_trace.zip'));
-      try { await context.tracing.stop({ path: tracePath }); } catch {}
-      return { status, screenshotPath: shotPath, tracePath };
-    }
+    await smartScreenshot(page, shotPath);
     return { status, screenshotPath: shotPath };
   } catch (err) {
-    const reason = err?.message || String(err);
-    try {
-      await page.screenshot({ path: shotPath, type: 'jpeg', quality: JPEG_QUALITY, fullPage: false });
-      const notePath = shotPath.replace(/\.jpe?g$/i, '.txt');
-      await fsp.writeFile(notePath, `Error: ${reason}\nURL: ${await page.url().catch(()=>'?')}\n`, 'utf8');
-      const htmlPath = shotPath.replace(/\.jpe?g$/i, '.html');
-      await fsp.writeFile(htmlPath, await page.content(), 'utf8');
-    } catch {}
-
-    if (ENABLE_TRACE) {
-      const tracePath = shotPath.replace(/\.jpe?g$/i, '_trace.zip');
-      try { await context.tracing.stop({ path: tracePath }); } catch {}
-      return { status: 'error', screenshotPath: shotPath, error: reason, tracePath };
-    }
-    return { status: 'error', screenshotPath: shotPath, error: reason };
+    try { await smartScreenshot(page, shotPath); } catch {}
+    return {
+      status: 'error',
+      screenshotPath: shotPath,
+      error: String((err && err.message) || err),
+    };
   } finally {
     try { await context.close(); } catch {}
   }
 }
 
-process.on('beforeExit', async () => { try { if (_browser) await _browser.close(); } catch {} });
+process.on('beforeExit', async () => {
+  try {
+    if (_browser) await _browser.close();
+  } catch {}
+});
 
 module.exports = { runAutomation, normalizeDOB };
