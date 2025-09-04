@@ -1,27 +1,24 @@
-# Use official Playwright image with all browser deps preinstalled
-FROM mcr.microsoft.com/playwright:v1.47.0-jammy
+# match your package.json's Playwright version
+FROM mcr.microsoft.com/playwright:v1.55.0-jammy
 
-# App directory
 WORKDIR /app
-
-# Only copy package files first to leverage Docker layer caching
 COPY package*.json ./
 
-# Install prod deps
-RUN npm ci --only=production
+# Fast/reproducible; if lockfile ever drifts, fallback to npm install
+RUN npm ci --omit=dev || npm install --omit=dev
 
-# Copy source
 COPY . .
 
-# Create a writable data mount for screenshots/zips (optional persistent disk)
+# Writeable path (pair with Render Disk if you want persistence)
 RUN mkdir -p /data/screenshots && chown -R pwuser:pwuser /data /app
 
-# Runtime env (can be overridden in Render)
 ENV NODE_ENV=production \
-    OUTPUT_ROOT=/data/screenshots
+    OUTPUT_ROOT=/data/screenshots \
+    PLAYWRIGHT_BROWSERS_PATH=0
 
-# Non-root user recommended in Playwright image
 USER pwuser
 
-# Start the worker
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
+  CMD node -e "process.exit(0)"
+
 CMD ["node", "bot.js"]
